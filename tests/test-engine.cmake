@@ -38,3 +38,17 @@ foreach(test_src ${donut_engine_tests})
 
 endforeach()
 
+donut_compile_shaders_all_platforms(
+    TARGET donut_test_texcoord_shaders
+    CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/shaders/Texcoords.cfg
+    FOLDER Donut/donut_tests
+    OUTPUT_BASE ${CMAKE_CURRENT_BINARY_DIR}/shaders
+    OUTPUT_FORMAT BINARY
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/shaders/texcoords_cs.hlsl
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/shaders/texcoord_raster.hlsl)
+add_dependencies(test_texcoords donut_test_texcoord_shaders)
+target_compile_definitions(test_texcoords PRIVATE DONUT_TEST_SHADER_DIR="${CMAKE_CURRENT_BINARY_DIR}/shaders")
+add_dependencies(test_texcoord_raster donut_test_texcoord_shaders)
+target_link_libraries(test_texcoord_raster donut_render)
+set_tests_properties(test_texcoord_raster PROPERTIES SKIP_RETURN_CODE 77)
+

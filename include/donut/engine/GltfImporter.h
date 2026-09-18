@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <donut/engine/SceneTypes.h>
 #include <memory>
 #include <filesystem>
 
@@ -58,6 +59,7 @@ namespace donut::engine
             TextureCache& textureCache,
             SceneLoadingStats& stats,
             ThreadPool* threadPool,
-            SceneImportResult& result) const;
+            SceneImportResult& result,
+            TexCoordFormat texCoordFormat = TexCoordFormat::Float32) const;
     };
 }

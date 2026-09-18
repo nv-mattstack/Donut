@@ -49,6 +49,7 @@ namespace donut::render
         bool frontCounterClockwise = false;
         bool reverseDepth = false;
         nvrhi::VariableRateShadingState shadingRateState{};
+        engine::TexCoordFormat texCoordFormat = engine::TexCoordFormat::Float32;
 
         bool operator==(const ForwardShadingPassPipelineKey& other) const
         {
@@ -56,6 +57,7 @@ namespace donut::render
                     cullMode == other.cullMode &&
                     frontCounterClockwise == other.frontCounterClockwise &&
                     reverseDepth == other.reverseDepth &&
+                    texCoordFormat == other.texCoordFormat &&
                     shadingRateState == other.shadingRateState;
         }
 
@@ -87,6 +89,7 @@ namespace std
             nvrhi::hash_combine(hash, key.cullMode);
             nvrhi::hash_combine(hash, key.frontCounterClockwise);
             nvrhi::hash_combine(hash, key.reverseDepth);
+            nvrhi::hash_combine(hash, key.texCoordFormat);
             nvrhi::hash_combine(hash, key.shadingRateState);
             return hash;
         }
@@ -104,10 +107,12 @@ namespace donut::render
         public:
             nvrhi::BindingSetHandle shadingBindingSet;
             nvrhi::BindingSetHandle inputBindingSet;
+            const engine::BufferGroup* inputBuffers = nullptr;
             ForwardShadingPassPipelineKey keyTemplate;
 
             uint32_t positionOffset = 0;
             uint32_t texCoordOffset = 0;
+            engine::TexCoordFormat texCoordFormat = engine::TexCoordFormat::Float32;
             uint32_t normalOffset = 0;
             uint32_t tangentOffset = 0;
         };
@@ -129,6 +134,9 @@ namespace donut::render
     protected:
         nvrhi::DeviceHandle m_Device;
         nvrhi::InputLayoutHandle m_InputLayout;
+        nvrhi::InputLayoutHandle m_InputLayoutFloat16;
+        nvrhi::InputLayoutHandle m_InputLayoutUnorm16;
+        CreateParameters m_CreateParameters;
         nvrhi::ShaderHandle m_VertexShader;
         nvrhi::ShaderHandle m_PixelShader;
         nvrhi::ShaderHandle m_PixelShaderTransmissive;
@@ -157,6 +165,8 @@ namespace donut::render
         virtual nvrhi::ShaderHandle CreateGeometryShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params);
         virtual nvrhi::ShaderHandle CreatePixelShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params, bool transmissiveMaterial);
         virtual nvrhi::InputLayoutHandle CreateInputLayout(nvrhi::IShader* vertexShader, const CreateParameters& params);
+        // Override this overload to customize layouts for all texture coordinate formats.
+        virtual nvrhi::InputLayoutHandle CreateInputLayout(nvrhi::IShader* vertexShader, const CreateParameters& params, engine::TexCoordFormat texCoordFormat);
         virtual nvrhi::BindingLayoutHandle CreateViewBindingLayout();
         virtual nvrhi::BindingSetHandle CreateViewBindingSet();
         virtual nvrhi::BindingLayoutHandle CreateShadingBindingLayout();

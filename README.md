@@ -72,6 +72,8 @@ Supported glTF extensions:
 
 In addition to glTF, Donut supports its own [JSON-based scene layout files](doc/SceneFile.md). Those files can load multiple glTF models and combine them into a larger scene graph, also add lights, cameras, animations, and apply animations to scene nodes imported from the models using their paths.
 
+GPU texture coordinates support optional FP16 and bounds-normalized UNORM16 storage alongside the default FP32 format. See [texture coordinate storage](doc/TextureCoordinates.md) for configuration and application integration.
+
 ### Render passes
 
 For a full list of render passes, refer to the headers in the [include/donut/render](include/donut/render) folder.

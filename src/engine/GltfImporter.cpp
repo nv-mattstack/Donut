@@ -643,7 +643,8 @@ bool GltfImporter::Load(
     TextureCache& textureCache,
     SceneLoadingStats& stats,
     ThreadPool* threadPool,
-    SceneImportResult& result) const
+    SceneImportResult& result,
+    TexCoordFormat texCoordFormat) const
 {
     // Set this to 'true' if you need to fix broken tangents in a model.
     // Patched buffers will be saved alongside the gltf file, named like "<scene-name>.buffer<N>.bin"
@@ -1056,6 +1057,7 @@ bool GltfImporter::Load(
     }
 
     auto buffers = std::make_shared<BufferGroup>();
+    buffers->texCoordFormat = texCoordFormat;
 
     buffers->indexData.resize(totalIndices);
     buffers->positionData.resize(totalVertices);

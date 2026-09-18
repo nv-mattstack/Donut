@@ -107,7 +107,9 @@ void donut::render::RenderView(
             stateValid = false;
         }
 
-        if (newMaterial)
+        // Input buffers can change the vertex layout and material binding state, even
+        // when adjacent draws share a material.
+        if (newMaterial || newBuffers)
         {
             drawMaterial = pass.SetupMaterial(passContext, item->material, item->cullMode, graphicsState);
 
@@ -133,6 +135,8 @@ void donut::render::RenderView(
 
             if (currentDraw.instanceCount > 0 && 
                 currentDraw.startIndexLocation == args.startIndexLocation && 
+                currentDraw.startVertexLocation == args.startVertexLocation &&
+                currentDraw.vertexCount == args.vertexCount &&
                 currentDraw.startInstanceLocation + currentDraw.instanceCount == args.startInstanceLocation)
             {
                 currentDraw.instanceCount += 1;

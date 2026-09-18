@@ -28,6 +28,8 @@
 
 DECLARE_CBUFFER(DepthPassConstants, g_Depth, DEPTH_BINDING_VIEW_CONSTANTS, DEPTH_SPACE_VIEW);
 
+DECLARE_PUSH_CONSTANTS(DepthPushConstants, g_Push, DEPTH_BINDING_PUSH_CONSTANTS, DEPTH_SPACE_INPUT);
+
 void input_assembler(
 	in float3 i_pos : POSITION,
     in float2 i_texCoord : TEXCOORD,
@@ -41,7 +43,7 @@ void input_assembler(
 	float4 worldPos = float4(mul(instanceMatrix, float4(i_pos, 1.0)), 1.0);
 	o_position = mul(worldPos, g_Depth.matWorldToClip);
 
-    o_texCoord = i_texCoord;
+    o_texCoord = DecodeTexCoord(i_texCoord, g_Push.texCoordFormat, g_Push.texCoordScaleBias);
 }
 
 // Use a raw buffer on DX11 to avoid adding the StructuredBuffer flag to the instance buffer.
@@ -54,7 +56,6 @@ StructuredBuffer<InstanceData> t_Instances : REGISTER_SRV(DEPTH_BINDING_INSTANCE
 #endif
 ByteAddressBuffer t_Vertices : REGISTER_SRV(DEPTH_BINDING_VERTEX_BUFFER, DEPTH_SPACE_INPUT);
 
-DECLARE_PUSH_CONSTANTS(DepthPushConstants, g_Push, DEPTH_BINDING_PUSH_CONSTANTS, DEPTH_SPACE_INPUT);
 
 
 // Version of the vertex shader that uses buffer loads to read vertex attributes and transforms.
@@ -75,7 +76,7 @@ void buffer_loads(
 #endif
 
     float3 pos = asfloat(t_Vertices.Load3(g_Push.positionOffset + i_vertex * c_SizeOfPosition));
-    float2 texCoord = asfloat(t_Vertices.Load2(g_Push.texCoordOffset + i_vertex * c_SizeOfTexcoord));
+    float2 texCoord = LoadTexCoord(t_Vertices, g_Push.texCoordOffset, i_vertex, g_Push.texCoordFormat, g_Push.texCoordScaleBias);
  
     float3 worldPos = mul(instance.transform, float4(pos, 1.0));
     o_texCoord = texCoord;

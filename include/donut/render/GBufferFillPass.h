@@ -50,21 +50,26 @@ namespace donut::render
                 bool alphaTested : 1;
                 bool frontCounterClockwise : 1;
                 bool reverseDepth : 1;
+                // Match the other bitfield storage sizes so MSVC keeps the key in one word.
+                uint8_t texCoordFormat : 2;
             } bits;
             uint32_t value;
 
-            static constexpr size_t Count = 1 << 5;
+            static constexpr size_t Count = 1 << 7;
         };
+        static_assert(sizeof(PipelineKey) == sizeof(uint32_t), "PipelineKey bits must fit its cache key");
 
         class Context : public GeometryPassContext
         {
         public:
             nvrhi::BindingSetHandle inputBindingSet;
+            const engine::BufferGroup* inputBuffers = nullptr;
             PipelineKey keyTemplate;
 
             uint32_t positionOffset = 0;
             uint32_t prevPositionOffset = 0;
             uint32_t texCoordOffset = 0;
+            engine::TexCoordFormat texCoordFormat = engine::TexCoordFormat::Float32;
             uint32_t normalOffset = 0;
             uint32_t tangentOffset = 0;
 
@@ -93,6 +98,9 @@ namespace donut::render
     protected:
         nvrhi::DeviceHandle m_Device;
         nvrhi::InputLayoutHandle m_InputLayout;
+        nvrhi::InputLayoutHandle m_InputLayoutFloat16;
+        nvrhi::InputLayoutHandle m_InputLayoutUnorm16;
+        CreateParameters m_CreateParameters;
         nvrhi::ShaderHandle m_VertexShader;
         nvrhi::ShaderHandle m_PixelShader;
         nvrhi::ShaderHandle m_PixelShaderAlphaTested;
@@ -120,6 +128,8 @@ namespace donut::render
         virtual nvrhi::ShaderHandle CreateGeometryShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params);
         virtual nvrhi::ShaderHandle CreatePixelShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params, bool alphaTested);
         virtual nvrhi::InputLayoutHandle CreateInputLayout(nvrhi::IShader* vertexShader, const CreateParameters& params);
+        // Override this overload to customize layouts for all texture coordinate formats.
+        virtual nvrhi::InputLayoutHandle CreateInputLayout(nvrhi::IShader* vertexShader, const CreateParameters& params, engine::TexCoordFormat texCoordFormat);
         virtual nvrhi::BindingLayoutHandle CreateInputBindingLayout();
         virtual nvrhi::BindingSetHandle CreateInputBindingSet(const engine::BufferGroup* bufferGroup);
         virtual void CreateViewBindings(nvrhi::BindingLayoutHandle& layout, nvrhi::BindingSetHandle& set, const CreateParameters& params);
