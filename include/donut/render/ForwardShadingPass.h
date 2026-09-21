@@ -115,6 +115,9 @@ namespace donut::render
             engine::TexCoordFormat texCoordFormat = engine::TexCoordFormat::Float32;
             uint32_t normalOffset = 0;
             uint32_t tangentOffset = 0;
+
+            // Keep the raw input fields together; only specialized UNORM IA uses this cache.
+            dm::float4 lastTexCoordScaleBias = dm::float4(1.f, 1.f, 0.f, 0.f);
         };
 
         struct CreateParameters
@@ -138,6 +141,11 @@ namespace donut::render
         nvrhi::InputLayoutHandle m_InputLayoutUnorm16;
         CreateParameters m_CreateParameters;
         nvrhi::ShaderHandle m_VertexShader;
+        nvrhi::ShaderHandle m_VertexShaderFloat;
+        nvrhi::BindingLayoutHandle m_InputBindingLayoutFloat;
+        nvrhi::BindingSetHandle m_InputBindingSetFloat;
+        nvrhi::BindingSetHandle m_InputBindingSetUnorm;
+        bool m_SpecializeInputAssemblerTexCoords = false;
         nvrhi::ShaderHandle m_PixelShader;
         nvrhi::ShaderHandle m_PixelShaderTransmissive;
         nvrhi::ShaderHandle m_GeometryShader;
@@ -161,6 +169,12 @@ namespace donut::render
         std::shared_ptr<engine::CommonRenderPasses> m_CommonPasses;
         std::shared_ptr<engine::MaterialBindingCache> m_MaterialBindings;
         
+        // Stock passes specialize floating-point IA inputs to omit push constants.
+        // Derived passes retain their existing shader/binding behavior by default.
+        // Opt in only when using the stock vertex/input bindings and when no other
+        // shader stage or custom draw code depends on the input push constants.
+        virtual bool SupportsInputAssemblerTexCoordSpecialization() const;
+
         virtual nvrhi::ShaderHandle CreateVertexShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params);
         virtual nvrhi::ShaderHandle CreateGeometryShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params);
         virtual nvrhi::ShaderHandle CreatePixelShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params, bool transmissiveMaterial);

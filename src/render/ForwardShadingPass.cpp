@@ -31,24 +31,29 @@
 #include <donut/core/log.h>
 #include <nvrhi/utils.h>
 #include <utility>
+#include <cstring>
+#include <typeinfo>
 
 #if DONUT_WITH_STATIC_SHADERS
 #if DONUT_WITH_DX11
 #include "compiled_shaders/passes/cubemap_gs.dxbc.h"
 #include "compiled_shaders/passes/forward_ps.dxbc.h"
 #include "compiled_shaders/passes/forward_vs_input_assembler.dxbc.h"
+#include "compiled_shaders/passes/forward_vs_input_assembler_float.dxbc.h"
 #include "compiled_shaders/passes/forward_vs_buffer_loads.dxbc.h"
 #endif
 #if DONUT_WITH_DX12
 #include "compiled_shaders/passes/cubemap_gs.dxil.h"
 #include "compiled_shaders/passes/forward_ps.dxil.h"
 #include "compiled_shaders/passes/forward_vs_input_assembler.dxil.h"
+#include "compiled_shaders/passes/forward_vs_input_assembler_float.dxil.h"
 #include "compiled_shaders/passes/forward_vs_buffer_loads.dxil.h"
 #endif
 #if DONUT_WITH_VULKAN
 #include "compiled_shaders/passes/cubemap_gs.spirv.h"
 #include "compiled_shaders/passes/forward_ps.spirv.h"
 #include "compiled_shaders/passes/forward_vs_input_assembler.spirv.h"
+#include "compiled_shaders/passes/forward_vs_input_assembler_float.spirv.h"
 #include "compiled_shaders/passes/forward_vs_buffer_loads.spirv.h"
 #endif
 #endif
@@ -77,8 +82,22 @@ void ForwardShadingPass::Init(ShaderFactory& shaderFactory, const CreateParamete
     if (params.singlePassCubemap)
         m_SupportedViewTypes = ViewType::CUBEMAP;
     
+    m_SpecializeInputAssemblerTexCoords = m_UseInputAssembler && SupportsInputAssemblerTexCoordSpecialization();
+    m_VertexShaderFloat = nullptr;
+    m_InputBindingLayoutFloat = nullptr;
+    m_InputBindingSetFloat = nullptr;
+    m_InputBindingSetUnorm = nullptr;
+    if (m_SpecializeInputAssemblerTexCoords)
+    {
+        std::vector<ShaderMacro> macros;
+        m_VertexShaderFloat = shaderFactory.CreateAutoShader("donut/passes/forward_vs.hlsl", "input_assembler_float",
+            DONUT_MAKE_PLATFORM_SHADER(g_forward_vs_input_assembler_float), &macros, nvrhi::ShaderType::Vertex);
+        if (!m_VertexShaderFloat)
+            m_SpecializeInputAssemblerTexCoords = false;
+    }
+
     m_VertexShader = CreateVertexShader(shaderFactory, params);
-    m_InputLayout = CreateInputLayout(m_VertexShader, params);
+    m_InputLayout = CreateInputLayout(m_SpecializeInputAssemblerTexCoords ? m_VertexShaderFloat : m_VertexShader, params);
     m_CreateParameters = params;
     m_InputLayoutFloat16 = nullptr;
     m_InputLayoutUnorm16 = nullptr;
@@ -103,6 +122,15 @@ void ForwardShadingPass::Init(ShaderFactory& shaderFactory, const CreateParamete
     m_ViewBindingSet = CreateViewBindingSet();
     m_ShadingBindingLayout = CreateShadingBindingLayout();
     m_InputBindingLayout = CreateInputBindingLayout();
+    if (m_SpecializeInputAssemblerTexCoords)
+    {
+        m_InputBindingLayoutFloat = m_Device->createBindingLayout(nvrhi::BindingLayoutDesc()
+            .setVisibility(nvrhi::ShaderType::Vertex)
+            .setRegisterSpaceAndDescriptorSet(FORWARD_SPACE_INPUT));
+        m_InputBindingSetFloat = m_Device->createBindingSet(nvrhi::BindingSetDesc(), m_InputBindingLayoutFloat);
+        // The stock IA binding set contains only push constants, so it needs no BufferGroup.
+        m_InputBindingSetUnorm = CreateInputBindingSet(nullptr);
+    }
 }
 
 void ForwardShadingPass::ResetBindingCache()
@@ -110,6 +138,13 @@ void ForwardShadingPass::ResetBindingCache()
     m_MaterialBindings->Clear();
     m_ShadingBindingSets.clear();
     m_InputBindingSets.clear();
+}
+
+bool ForwardShadingPass::SupportsInputAssemblerTexCoordSpecialization() const
+{
+    // A derived pass may replace any shader or binding factory. Preserve that
+    // contract unless the derived class explicitly opts into the stock fast path.
+    return typeid(*this) == typeid(ForwardShadingPass);
 }
 
 nvrhi::ShaderHandle ForwardShadingPass::CreateVertexShader(ShaderFactory& shaderFactory, const CreateParameters& params)
@@ -247,26 +282,28 @@ nvrhi::BindingSetHandle ForwardShadingPass::CreateShadingBindingSet(nvrhi::IText
 nvrhi::GraphicsPipelineHandle ForwardShadingPass::CreateGraphicsPipeline(ForwardShadingPassPipelineKey const& key,
     nvrhi::FramebufferInfo const& framebufferInfo)
 {
+    const bool floatingInput = m_SpecializeInputAssemblerTexCoords && key.texCoordFormat != TexCoordFormat::Unorm16;
+    const auto& vertexShader = floatingInput ? m_VertexShaderFloat : m_VertexShader;
     auto& inputLayout = key.texCoordFormat == TexCoordFormat::Float16 ? m_InputLayoutFloat16
         : key.texCoordFormat == TexCoordFormat::Unorm16 ? m_InputLayoutUnorm16 : m_InputLayout;
 
     if (key.texCoordFormat != TexCoordFormat::Float32 && !inputLayout)
     {
-        inputLayout = CreateInputLayout(m_VertexShader, m_CreateParameters, key.texCoordFormat);
+        inputLayout = CreateInputLayout(vertexShader, m_CreateParameters, key.texCoordFormat);
         if (!inputLayout)
             return nullptr;
     }
 
     nvrhi::GraphicsPipelineDesc pipelineDesc;
     pipelineDesc.inputLayout = inputLayout;
-    pipelineDesc.VS = m_VertexShader;
+    pipelineDesc.VS = vertexShader;
     pipelineDesc.GS = m_GeometryShader;
     pipelineDesc.renderState.rasterState.frontCounterClockwise = key.frontCounterClockwise;
     pipelineDesc.renderState.rasterState.setCullMode(key.cullMode);
     pipelineDesc.renderState.blendState.alphaToCoverageEnable = false;
     pipelineDesc.shadingRateState = key.shadingRateState;
     pipelineDesc.bindingLayouts = { m_MaterialBindings->GetLayout(), m_ViewBindingLayout, m_ShadingBindingLayout };
-    pipelineDesc.bindingLayouts.push_back(m_InputBindingLayout);
+    pipelineDesc.bindingLayouts.push_back(floatingInput ? m_InputBindingLayoutFloat : m_InputBindingLayout);
 
     bool const framebufferUsesMSAA = framebufferInfo.sampleCount > 1;
 
@@ -351,6 +388,7 @@ void ForwardShadingPass::SetupView(
     const IView* viewPrev)
 {
     auto& context = static_cast<Context&>(abstractContext);
+    context.pushConstantsValid = false;
     
     ForwardShadingViewConstants viewConstants = {};
     view->FillPlanarViewConstants(viewConstants.view);
@@ -597,6 +635,13 @@ nvrhi::BindingSetHandle ForwardShadingPass::CreateInputBindingSet(const BufferGr
 
 nvrhi::BindingSetHandle ForwardShadingPass::GetOrCreateInputBindingSet(const BufferGroup* bufferGroup)
 {
+    if (m_SpecializeInputAssemblerTexCoords)
+    {
+        if (bufferGroup->texCoordFormat != TexCoordFormat::Unorm16)
+            return m_InputBindingSetFloat;
+        return m_InputBindingSetUnorm;
+    }
+
     auto it = m_InputBindingSets.find(bufferGroup);
     if (it == m_InputBindingSets.end())
     {
@@ -616,26 +661,54 @@ void ForwardShadingPass::SetPushConstants(
 {
     auto& context = static_cast<Context&>(abstractContext);
 
-    ForwardPushConstants constants = {};
-    constants.startInstanceLocation = args.startInstanceLocation;
-    constants.startVertexLocation = args.startVertexLocation;
-    constants.positionOffset = context.positionOffset;
-    constants.texCoordOffset = context.texCoordOffset;
-    constants.texCoordFormat = uint32_t(context.texCoordFormat);
-    constants.texCoordScaleBias = float4(1.f, 1.f, 0.f, 0.f);
-    if (context.texCoordFormat == TexCoordFormat::Unorm16 && context.inputBuffers)
+    if (!m_SpecializeInputAssemblerTexCoords)
     {
-        const auto& decode = context.inputBuffers->getTexCoordDecodeRange(args.startVertexLocation).texCoord1;
+        // Preserve the original raw/custom path, including all per-draw fields.
+        ForwardPushConstants constants = {};
+        constants.startInstanceLocation = args.startInstanceLocation;
+        constants.startVertexLocation = args.startVertexLocation;
+        constants.positionOffset = context.positionOffset;
+        constants.texCoordOffset = context.texCoordOffset;
+        constants.texCoordFormat = uint32_t(context.texCoordFormat);
+        constants.texCoordScaleBias = float4(1.f, 1.f, 0.f, 0.f);
+        if (context.texCoordFormat == TexCoordFormat::Unorm16 && context.inputBuffers)
+        {
+            const uint32_t rangeHint = context.geometry ? context.geometry->texCoordDecodeRangeIndex : ~0u;
+            const auto& decode = context.inputBuffers->getTexCoordDecodeRange(args.startVertexLocation, rangeHint).texCoord1;
+            constants.texCoordScaleBias = float4(decode.scale, decode.offset);
+        }
+        constants.normalOffset = context.normalOffset;
+        constants.tangentOffset = context.tangentOffset;
+
+        commandList->setPushConstants(&constants, sizeof(constants));
+
+        if (!m_UseInputAssembler)
+        {
+            args.startInstanceLocation = 0;
+            args.startVertexLocation = 0;
+        }
+        return;
+    }
+
+    if (context.texCoordFormat != TexCoordFormat::Unorm16)
+        return;
+
+    ForwardPushConstants constants = {};
+    constants.texCoordFormat = uint32_t(TexCoordFormat::Unorm16);
+    constants.texCoordScaleBias = float4(1.f, 1.f, 0.f, 0.f);
+    if (context.inputBuffers)
+    {
+        const uint32_t rangeHint = context.geometry ? context.geometry->texCoordDecodeRangeIndex : ~0u;
+        const auto& decode = context.inputBuffers->getTexCoordDecodeRange(args.startVertexLocation, rangeHint).texCoord1;
         constants.texCoordScaleBias = float4(decode.scale, decode.offset);
     }
-    constants.normalOffset = context.normalOffset;
-    constants.tangentOffset = context.tangentOffset;
 
+    // Only RenderView enables this cache, and it invalidates it after every
+    // graphics-state change as required by NVRHI. Manual users always write.
+    if (context.enablePushConstantCaching && context.pushConstantsValid
+        && std::memcmp(&context.lastTexCoordScaleBias, &constants.texCoordScaleBias, sizeof(float4)) == 0)
+        return;
+    context.lastTexCoordScaleBias = constants.texCoordScaleBias;
+    context.pushConstantsValid = context.enablePushConstantCaching;
     commandList->setPushConstants(&constants, sizeof(constants));
-
-    if (!m_UseInputAssembler)
-    {
-        args.startInstanceLocation = 0;
-        args.startVertexLocation = 0;
-    }
 }

@@ -55,14 +55,20 @@ set(byproducts
 	passes/cubemap_gs
 	passes/deferred_lighting_cs
 	passes/depth_ps
-	passes/depth_vs
+	passes/depth_vs_input_assembler
+	passes/depth_vs_input_assembler_float
+	passes/depth_vs_buffer_loads
 	passes/dlss_exposure_cs
 	passes/environment_map_ps
 	passes/exposure_cs
 	passes/forward_ps
-	passes/forward_vs
+	passes/forward_vs_input_assembler
+	passes/forward_vs_input_assembler_float
+	passes/forward_vs_buffer_loads
 	passes/gbuffer_ps
-	passes/gbuffer_vs
+	passes/gbuffer_vs_input_assembler
+	passes/gbuffer_vs_input_assembler_float
+	passes/gbuffer_vs_buffer_loads
 	passes/manipulator_vs_main
 	passes/manipulator_gs_main
 	passes/manipulator_ps_main

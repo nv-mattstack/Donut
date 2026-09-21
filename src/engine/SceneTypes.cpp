@@ -338,7 +338,7 @@ bool PointLight::SetProperty(const std::string& name, const dm::float4& value)
     return Light::SetProperty(name, value);
 }
 
-const TexCoordDecodeRange& BufferGroup::getTexCoordDecodeRange(uint32_t vertexIndex) const
+uint32_t BufferGroup::getTexCoordDecodeRangeIndex(uint32_t vertexIndex) const
 {
     const auto next = std::upper_bound(texCoordDecodeRanges.begin(), texCoordDecodeRanges.end(), vertexIndex,
         [](uint32_t vertex, const TexCoordDecodeRange& range) { return vertex < range.vertexOffset; });
@@ -346,8 +346,17 @@ const TexCoordDecodeRange& BufferGroup::getTexCoordDecodeRange(uint32_t vertexIn
     {
         const auto& range = *(next - 1);
         if (vertexIndex - range.vertexOffset < range.numVertices)
-            return range;
+            return uint32_t(next - texCoordDecodeRanges.begin() - 1);
     }
+
+    return ~0u;
+}
+
+const TexCoordDecodeRange& BufferGroup::getTexCoordDecodeRange(uint32_t vertexIndex) const
+{
+    const uint32_t rangeIndex = getTexCoordDecodeRangeIndex(vertexIndex);
+    if (rangeIndex != ~0u)
+        return texCoordDecodeRanges[rangeIndex];
 
     static const TexCoordDecodeRange identity;
     return identity;

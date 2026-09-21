@@ -38,6 +38,10 @@ foreach(test_src ${donut_engine_tests})
 
 endforeach()
 
+# Functions are globally visible, but the Vulkan register-offset defaults are
+# directory-scoped. Initialize them here as well as in the production shaders target.
+include(${CMAKE_CURRENT_LIST_DIR}/../compileshaders.cmake)
+
 donut_compile_shaders_all_platforms(
     TARGET donut_test_texcoord_shaders
     CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/shaders/Texcoords.cfg

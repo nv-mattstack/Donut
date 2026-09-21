@@ -362,6 +362,20 @@ namespace donut::engine
         [[nodiscard]] uint32_t getTexCoordStride() const { return texCoordFormat == TexCoordFormat::Float32 ? 8u : 4u; }
         // Returns an identity decode when no range covers the vertex (including the floating-point formats).
         [[nodiscard]] const TexCoordDecodeRange& getTexCoordDecodeRange(uint32_t vertexIndex) const;
+        // The hint is only an optimization: validate against the current ranges so shared geometries,
+        // changed vertex offsets, and rebuilt metadata do not require explicit cache invalidation.
+        [[nodiscard]] const TexCoordDecodeRange& getTexCoordDecodeRange(uint32_t vertexIndex, uint32_t rangeIndexHint) const
+        {
+            if (rangeIndexHint < texCoordDecodeRanges.size())
+            {
+                const auto& range = texCoordDecodeRanges[rangeIndexHint];
+                if (vertexIndex >= range.vertexOffset && vertexIndex - range.vertexOffset < range.numVertices)
+                    return range;
+            }
+            return getTexCoordDecodeRange(vertexIndex);
+        }
+        // Returns ~0u when no sorted, non-overlapping range contains the vertex.
+        [[nodiscard]] uint32_t getTexCoordDecodeRangeIndex(uint32_t vertexIndex) const;
         [[nodiscard]] bool hasAttribute(VertexAttribute attr) const { return vertexBufferRanges[int(attr)].byteSize != 0; }
         nvrhi::BufferRange& getVertexBufferRange(VertexAttribute attr) { return vertexBufferRanges[int(attr)]; }
         [[nodiscard]] const nvrhi::BufferRange& getVertexBufferRange(VertexAttribute attr) const { return vertexBufferRanges[int(attr)]; }
@@ -385,6 +399,9 @@ namespace donut::engine
         uint32_t numIndices = 0;
         uint32_t numVertices = 0;
         int globalGeometryIndex = 0;
+
+        // Populated during buffer preparation. Never use without validating against the buffer's live ranges.
+        uint32_t texCoordDecodeRangeIndex = ~0u;
 
         MeshGeometryPrimitiveType type = MeshGeometryPrimitiveType::Triangles;
 

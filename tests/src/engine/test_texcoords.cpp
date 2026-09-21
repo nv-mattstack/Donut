@@ -25,10 +25,46 @@ using namespace donut::math;
 #include <cstring>
 #include <cmath>
 #include <limits>
+#include <atomic>
 
 using namespace donut;
 using namespace donut::engine;
 using namespace donut::math;
+
+namespace
+{
+    class LogErrorCounter
+    {
+        log::Callback previous = log::GetCallback();
+        bool strictVulkanValidation;
+
+    public:
+        std::atomic<uint32_t> errors{ 0 };
+        std::atomic<uint32_t> nativeWarnings{ 0 };
+
+        explicit LogErrorCounter(bool strictVulkanValidation)
+            : strictVulkanValidation(strictVulkanValidation)
+        {
+            log::SetCallback([this](log::Severity severity, const char* message)
+            {
+                if (severity >= log::Severity::Error)
+                    ++errors;
+                else if (severity == log::Severity::Warning && std::strncmp(message, "[Vulkan:", 8) == 0)
+                    ++nativeWarnings;
+                previous(severity, message);
+            });
+        }
+
+        ~LogErrorCounter() { log::SetCallback(previous); }
+
+        void Report() const
+        {
+            if (strictVulkanValidation)
+                std::printf("Validation log: %u errors, %u native warnings (all messages reported)\n",
+                    errors.load(), nativeWarnings.load());
+        }
+    };
+}
 
 static_assert(sizeof(GeometryData) == 96);
 static_assert(offsetof(GeometryData, texCoordFormat) == 52);
@@ -82,6 +118,65 @@ static void TestDescriptors()
     CHECK(position.format == nvrhi::Format::RGB32_FLOAT && position.elementStride == 12);
     buffers.texCoordFormat = TexCoordFormat::Unorm16;
     CHECK(buffers.getTexCoordStride() == 4);
+}
+
+static void TestDecodeRangeHints()
+{
+    BufferGroup buffers;
+    TexCoordDecodeRange first;
+    first.vertexOffset = 4;
+    first.numVertices = 3;
+    first.texCoord1.scale = float2(2.f, 3.f);
+    first.texCoord1.offset = float2(-8.f, 12.f);
+    TexCoordDecodeRange second = first;
+    second.vertexOffset = 10;
+    second.numVertices = 4;
+    second.texCoord1.offset = float2(100.f, -200.f);
+    buffers.texCoordDecodeRanges = { first, second };
+
+    // Hints are an optimization: missing, stale, and out-of-range values must
+    // preserve the lookup result, including gaps and both interval boundaries.
+    for (uint32_t vertex : { 0u, 3u, 4u, 6u, 7u, 9u, 10u, 13u, 14u, ~0u })
+    {
+        const uint32_t expectedIndex = vertex >= 4 && vertex < 7 ? 0u
+            : vertex >= 10 && vertex < 14 ? 1u : ~0u;
+        CHECK(buffers.getTexCoordDecodeRangeIndex(vertex) == expectedIndex);
+        const auto& expected = buffers.getTexCoordDecodeRange(vertex);
+        for (uint32_t hint : { 0u, 1u, 2u, 999u, ~0u })
+            CHECK(&buffers.getTexCoordDecodeRange(vertex, hint) == &expected);
+    }
+
+    const uint32_t savedHint = buffers.getTexCoordDecodeRangeIndex(11);
+    buffers.texCoordDecodeRanges[1].texCoord1.scale = float2(0.f, 7.f);
+    buffers.texCoordDecodeRanges[1].texCoord1.offset = float2(-3.f, 0.5f);
+    CHECK(buffers.getTexCoordDecodeRange(11, savedHint).texCoord1.scale.y == 7.f);
+    CHECK(buffers.getTexCoordDecodeRange(11, savedHint).texCoord1.offset.x == -3.f);
+
+    // A rebuilt vector can move the same domain to another index. A stale hint
+    // must search the live vector instead of retaining a pointer or decode copy.
+    TexCoordDecodeRange leading = first;
+    leading.vertexOffset = 0;
+    leading.numVertices = 2;
+    std::vector<TexCoordDecodeRange> rebuilt = { leading, first, second };
+    rebuilt[2].texCoord2.scale = float2(9.f, 11.f);
+    buffers.texCoordDecodeRanges.swap(rebuilt);
+    CHECK(buffers.getTexCoordDecodeRangeIndex(11) == 2u);
+    CHECK(&buffers.getTexCoordDecodeRange(11, savedHint) == &buffers.texCoordDecodeRanges[2]);
+    CHECK(buffers.getTexCoordDecodeRange(11, savedHint).texCoord2.scale.y == 11.f);
+
+    buffers.texCoordDecodeRanges.clear();
+    CHECK(buffers.getTexCoordDecodeRangeIndex(11) == ~0u);
+    const auto& identity = buffers.getTexCoordDecodeRange(11, savedHint);
+    CHECK(identity.texCoord1.scale.x == 1.f && identity.texCoord1.scale.y == 1.f);
+    CHECK(identity.texCoord1.offset.x == 0.f && identity.texCoord1.offset.y == 0.f);
+
+    // Unsigned subtraction alone would mistake a vertex before this interval
+    // for a hit when its length is near the uint32 limit.
+    second.vertexOffset = 10;
+    second.numVertices = ~0u;
+    buffers.texCoordDecodeRanges = { second };
+    CHECK(buffers.getTexCoordDecodeRangeIndex(8) == ~0u);
+    CHECK(&buffers.getTexCoordDecodeRange(8, 0) == &buffers.getTexCoordDecodeRange(8));
 }
 
 class TestScene : public Scene
@@ -235,6 +330,8 @@ static void CheckGeometry(TestScene& scene, const MeshInfo& mesh, TexCoordFormat
             ? buffers.getVertexBufferRange(VertexAttribute::TexCoord2).byteOffset + vertex * buffers.getTexCoordStride()
             : ~0u));
         const auto& decode = buffers.getTexCoordDecodeRange(vertex);
+        CHECK(geometry->texCoordDecodeRangeIndex == buffers.getTexCoordDecodeRangeIndex(vertex));
+        CHECK(&buffers.getTexCoordDecodeRange(vertex, geometry->texCoordDecodeRangeIndex) == &decode);
         const float4 scaleBias1(decode.texCoord1.scale, decode.texCoord1.offset);
         const float4 scaleBias2(decode.texCoord2.scale, decode.texCoord2.offset);
         CHECK(std::memcmp(&data->texCoord1ScaleBias, &scaleBias1, sizeof(scaleBias1)) == 0);
@@ -305,16 +402,28 @@ static void CheckGpuUVs(nvrhi::IDevice* device, nvrhi::IComputePipeline* pipelin
                     std::memcpy(&actual, result + vertex * 8 + stream * 4, sizeof(actual));
                     const auto& decode = buffers.getTexCoordDecodeRange(vertex);
                     const auto& transform = stream == 0 ? decode.texCoord1 : decode.texCoord2;
+                    bool decodedMatches = true;
                     for (uint32_t axis = 0; axis < 2; ++axis)
                     {
                         // Quantization plus FP32 unpack/reconstruction rounding, including large offsets.
                         const double tolerance = double(transform.scale[axis]) / (2.0 * 65535.0)
                             + 2.0 * std::numeric_limits<float>::epsilon()
                                 * (std::abs(double(transform.offset[axis])) + transform.scale[axis]);
-                        matches &= std::isfinite(actual[axis])
+                        decodedMatches &= std::isfinite(actual[axis])
                             && std::abs(double(actual[axis]) - decoded[axis]) <= tolerance;
                     }
-                    matches &= result[vertex * 8 + stream * 4 + 3] == 0;
+                    decodedMatches &= result[vertex * 8 + stream * 4 + 3] == 0;
+                    if (!decodedMatches)
+                    {
+                        const auto* words = result + vertex * 8 + stream * 4;
+                        std::fprintf(stderr, "UV mismatch format=%u skinned=%d first=%u count=%u vertex=%u stream=%u: "
+                            "expected=(%.9g, %.9g) actual=(%.9g, %.9g) scale=(%.9g, %.9g) bias=(%.9g, %.9g) "
+                            "words=(%08x, %08x, %08x, %08x)\n",
+                            uint32_t(buffers.texCoordFormat), int(skinned), first, count, vertex, stream,
+                            decoded.x, decoded.y, actual.x, actual.y, transform.scale.x, transform.scale.y,
+                            transform.offset.x, transform.offset.y, words[0], words[1], words[2], words[3]);
+                    }
+                    matches &= decodedMatches;
                     continue;
                 }
                 else if (buffers.texCoordFormat == TexCoordFormat::Float16)
@@ -327,7 +436,16 @@ static void CheckGpuUVs(nvrhi::IDevice* device, nvrhi::IComputePipeline* pipelin
                     std::memcpy(expected + 2, &decoded, sizeof(decoded));
                 std::memcpy(expected, &decoded, sizeof(decoded));
             }
-            matches &= std::memcmp(result + vertex * 8 + stream * 4, expected, sizeof(expected)) == 0;
+            const auto* actual = result + vertex * 8 + stream * 4;
+            const bool wordsMatch = std::memcmp(actual, expected, sizeof(expected)) == 0;
+            if (!wordsMatch)
+            {
+                std::fprintf(stderr, "UV mismatch format=%u skinned=%d first=%u count=%u vertex=%u stream=%u: "
+                    "expected words=(%08x, %08x, %08x, %08x) actual=(%08x, %08x, %08x, %08x)\n",
+                    uint32_t(buffers.texCoordFormat), int(skinned), first, count, vertex, stream,
+                    expected[0], expected[1], expected[2], expected[3], actual[0], actual[1], actual[2], actual[3]);
+            }
+            matches &= wordsMatch;
         }
     }
     device->unmapBuffer(readback);
@@ -423,21 +541,42 @@ int main(int argc, char** argv)
     try
     {
         TestDescriptors();
+        TestDecodeRangeHints();
         const char* shaderDirectory = nullptr;
-        for (int i = 1; i + 1 < argc; ++i)
-            if (std::strcmp(argv[i], "--gpu") == 0)
+        bool debugRuntime = false;
+        for (int i = 1; i < argc; ++i)
+        {
+            if (std::strcmp(argv[i], "--gpu") == 0 && i + 1 < argc)
                 shaderDirectory = argv[++i];
+            else if (std::strcmp(argv[i], "--debug-runtime") == 0)
+                debugRuntime = true;
+        }
+        const auto graphicsApi = app::GetGraphicsAPIFromCommandLine(argc, argv);
+        LogErrorCounter logErrors(debugRuntime && graphicsApi == nvrhi::GraphicsAPI::VULKAN);
         if (shaderDirectory)
         {
-            std::unique_ptr<app::DeviceManager> manager(app::DeviceManager::Create(app::GetGraphicsAPIFromCommandLine(argc, argv)));
+            std::unique_ptr<app::DeviceManager> manager(app::DeviceManager::Create(graphicsApi));
             CHECK(manager != nullptr);
             app::DeviceCreationParameters params;
             params.enableNvrhiValidationLayer = true;
+            params.enableDebugRuntime = debugRuntime;
+#if DONUT_WITH_VULKAN
+            if (debugRuntime)
+                params.ignoredVulkanValidationMessageLocations.clear();
+#endif
             CHECK(manager->CreateHeadlessDevice(params));
+            if (debugRuntime && graphicsApi == nvrhi::GraphicsAPI::VULKAN)
+            {
+                CHECK(manager->IsVulkanLayerEnabled("VK_LAYER_KHRONOS_validation"));
+                std::puts("Khronos Vulkan validation layer: ENABLED (errors checked, all messages reported)");
+            }
             TestGpu(manager->GetDevice(), shaderDirectory);
             manager->GetDevice()->waitForIdle();
         }
-        printf("Texture coordinate tests: PASS (%s)\n", shaderDirectory ? "CPU and GPU" : "CPU; use --gpu <Donut shader directory> for GPU tests");
+        logErrors.Report();
+        CHECK(logErrors.errors.load() == 0);
+        printf("Texture coordinate tests: PASS (%s)\n", shaderDirectory ? "CPU and GPU"
+            : "CPU; use --gpu <Donut shader directory> [-dx11|-dx12|-vk] [--debug-runtime] for GPU tests");
         return 0;
     }
     catch (const std::exception& error)

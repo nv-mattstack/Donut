@@ -1287,6 +1287,18 @@ void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
             skinnedInstance->skinningBindingSet = m_Device->createBindingSet(setDesc, m_SkinningBindingLayout);
         }
     }
+
+    // Resolve after all shared buffers and remapped skinned ranges are finalized. Hints contain
+    // indices rather than pointers or copied decode values, and readers always validate them.
+    for (const auto& mesh : m_SceneGraph->GetMeshes())
+    {
+        for (const auto& geometry : mesh->geometries)
+        {
+            geometry->texCoordDecodeRangeIndex = mesh->buffers && mesh->buffers->texCoordFormat == TexCoordFormat::Unorm16
+                ? mesh->buffers->getTexCoordDecodeRangeIndex(mesh->vertexOffset + geometry->vertexOffsetInMesh)
+                : ~0u;
+        }
+    }
 }
 
 nvrhi::BufferHandle Scene::CreateMaterialBuffer()
@@ -1386,7 +1398,7 @@ void Scene::UpdateGeometry(const std::shared_ptr<MeshInfo>& mesh)
         gdata.indexOffset = indexOffset * sizeof(uint32_t);
         gdata.vertexBufferIndex = mesh->buffers->vertexBufferDescriptor ? mesh->buffers->vertexBufferDescriptor->Get() : -1;
         gdata.texCoordFormat = uint32_t(mesh->buffers->texCoordFormat);
-        const auto& texCoordDecode = mesh->buffers->getTexCoordDecodeRange(vertexOffset);
+        const auto& texCoordDecode = mesh->buffers->getTexCoordDecodeRange(vertexOffset, geometry->texCoordDecodeRangeIndex);
         gdata.texCoord1ScaleBias = float4(texCoordDecode.texCoord1.scale, texCoordDecode.texCoord1.offset);
         gdata.texCoord2ScaleBias = float4(texCoordDecode.texCoord2.scale, texCoordDecode.texCoord2.offset);
         gdata.positionOffset = mesh->buffers->hasAttribute(VertexAttribute::Position)

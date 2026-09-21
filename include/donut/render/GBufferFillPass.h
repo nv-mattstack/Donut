@@ -73,6 +73,9 @@ namespace donut::render
             uint32_t normalOffset = 0;
             uint32_t tangentOffset = 0;
 
+            // Keep the raw input fields together; only specialized UNORM IA uses this cache.
+            dm::float4 lastTexCoordScaleBias = dm::float4(1.f, 1.f, 0.f, 0.f);
+
             Context()
             {
                 keyTemplate.value = 0;
@@ -102,6 +105,11 @@ namespace donut::render
         nvrhi::InputLayoutHandle m_InputLayoutUnorm16;
         CreateParameters m_CreateParameters;
         nvrhi::ShaderHandle m_VertexShader;
+        nvrhi::ShaderHandle m_VertexShaderFloat;
+        nvrhi::BindingLayoutHandle m_InputBindingLayoutFloat;
+        nvrhi::BindingSetHandle m_InputBindingSetFloat;
+        nvrhi::BindingSetHandle m_InputBindingSetUnorm;
+        bool m_SpecializeInputAssemblerTexCoords = false;
         nvrhi::ShaderHandle m_PixelShader;
         nvrhi::ShaderHandle m_PixelShaderAlphaTested;
         nvrhi::ShaderHandle m_GeometryShader;
@@ -124,6 +132,12 @@ namespace donut::render
         bool m_UseInputAssembler = false;
         uint32_t m_StencilWriteMask = 0;
         
+        // Stock passes specialize floating-point IA inputs to omit push constants.
+        // Derived passes retain their existing shader/binding behavior by default.
+        // Opt in only when using the stock vertex/input bindings and when no other
+        // shader stage or custom draw code depends on the input push constants.
+        virtual bool SupportsInputAssemblerTexCoordSpecialization() const;
+
         virtual nvrhi::ShaderHandle CreateVertexShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params);
         virtual nvrhi::ShaderHandle CreateGeometryShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params);
         virtual nvrhi::ShaderHandle CreatePixelShader(engine::ShaderFactory& shaderFactory, const CreateParameters& params, bool alphaTested);

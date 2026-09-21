@@ -7,6 +7,7 @@
 #include <donut/core/math/float.h>
 #include <donut/core/vfs/VFS.h>
 #include <donut/engine/CommonRenderPasses.h>
+#include <donut/engine/MaterialBindingCache.h>
 #include <donut/engine/SceneGraph.h>
 #include <donut/engine/ShaderFactory.h>
 #include <donut/engine/View.h>
@@ -16,11 +17,14 @@
 #include <donut/render/GBufferFillPass.h>
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace donut;
@@ -35,6 +39,38 @@ namespace
     constexpr uint32_t Height = 32;
     constexpr size_t GroupCount = 5;
 
+    class LogErrorCounter
+    {
+        log::Callback previous = log::GetCallback();
+        bool strictVulkanValidation;
+
+    public:
+        std::atomic<uint32_t> errors{ 0 };
+        std::atomic<uint32_t> nativeWarnings{ 0 };
+
+        explicit LogErrorCounter(bool strictVulkanValidation)
+            : strictVulkanValidation(strictVulkanValidation)
+        {
+            log::SetCallback([this](log::Severity severity, const char* message)
+            {
+                if (severity >= log::Severity::Error)
+                    ++errors;
+                else if (severity == log::Severity::Warning && std::strncmp(message, "[Vulkan:", 8) == 0)
+                    ++nativeWarnings;
+                previous(severity, message);
+            });
+        }
+
+        ~LogErrorCounter() { log::SetCallback(previous); }
+
+        void Report() const
+        {
+            if (strictVulkanValidation)
+                std::printf("Validation log: %u errors, %u native warnings (all messages reported)\n",
+                    errors.load(), nativeWarnings.load());
+        }
+    };
+
     nvrhi::ShaderHandle CreateTestPixelShader(ShaderFactory& factory, const char* entry = "scene")
     {
         return factory.CreateShader("tests/texcoord_raster.hlsl", entry, nullptr, nvrhi::ShaderType::Pixel);
@@ -44,10 +80,14 @@ namespace
     {
     public:
         using DepthPass::DepthPass;
+        void ClearMaterialBindings() { m_MaterialBindings->Clear(); }
         uint32_t float16LayoutCount = 0;
         uint32_t unorm16LayoutCount = 0;
 
     protected:
+        // These adapters only replace the pixel shader; the stock vertex path is safe.
+        bool SupportsInputAssemblerTexCoordSpecialization() const override { return true; }
+
         nvrhi::ShaderHandle CreatePixelShader(ShaderFactory& factory, const CreateParameters&) override
         {
             return CreateTestPixelShader(factory, "depth");
@@ -67,8 +107,11 @@ namespace
     {
     public:
         using ForwardShadingPass::ForwardShadingPass;
+        void ClearMaterialBindings() { m_MaterialBindings->Clear(); }
 
     protected:
+        bool SupportsInputAssemblerTexCoordSpecialization() const override { return true; }
+
         nvrhi::ShaderHandle CreatePixelShader(ShaderFactory& factory, const CreateParameters&, bool) override
         {
             return CreateTestPixelShader(factory);
@@ -79,11 +122,36 @@ namespace
     {
     public:
         using GBufferFillPass::GBufferFillPass;
+        void ClearMaterialBindings() { m_MaterialBindings->Clear(); }
 
     protected:
+        bool SupportsInputAssemblerTexCoordSpecialization() const override { return true; }
+
         nvrhi::ShaderHandle CreatePixelShader(ShaderFactory& factory, const CreateParameters&, bool) override
         {
             return CreateTestPixelShader(factory);
+        }
+    };
+
+    // Existing applications can override the vertex shader. The stock fast path
+    // must not silently replace their shader or omit its required constants.
+    class LegacyDepthPass : public DepthPass
+    {
+    public:
+        using DepthPass::DepthPass;
+        void ClearMaterialBindings() { m_MaterialBindings->Clear(); }
+
+    protected:
+        nvrhi::ShaderHandle CreateVertexShader(ShaderFactory& factory, const CreateParameters& params) override
+        {
+            return params.useInputAssembler
+                ? factory.CreateShader("tests/texcoord_raster.hlsl", "custom_depth", nullptr, nvrhi::ShaderType::Vertex)
+                : DepthPass::CreateVertexShader(factory, params);
+        }
+
+        nvrhi::ShaderHandle CreatePixelShader(ShaderFactory& factory, const CreateParameters&) override
+        {
+            return CreateTestPixelShader(factory, "depth");
         }
     };
 
@@ -91,12 +159,15 @@ namespace
     {
         std::shared_ptr<SceneGraph> graph = std::make_shared<SceneGraph>();
         std::shared_ptr<Material> material = std::make_shared<Material>();
+        std::shared_ptr<Material> alternateMaterial;
         std::array<std::shared_ptr<MeshInstance>, GroupCount> instances;
         std::array<DrawItem, GroupCount> draws{};
         std::array<float2, GroupCount> expected;
         nvrhi::TextureHandle color;
+        nvrhi::TextureHandle alternateColor;
         nvrhi::TextureHandle depth;
         nvrhi::FramebufferHandle framebuffer;
+        nvrhi::FramebufferHandle alternateFramebuffer;
         nvrhi::StagingTextureHandle readback;
         PlanarView view;
 
@@ -108,12 +179,18 @@ namespace
             material->domain = MaterialDomain::AlphaTested;
             material->baseOrDiffuseTexture = std::make_shared<LoadedTexture>();
             material->baseOrDiffuseTexture->texture = common.m_WhiteTexture;
+            material->baseOrDiffuseColor = float3(0.25f);
             material->materialConstants = device->createBuffer(nvrhi::BufferDesc()
                 .setByteSize(sizeof(MaterialConstants)).setIsConstantBuffer(true)
                 .enableAutomaticStateTracking(nvrhi::ResourceStates::ConstantBuffer));
             MaterialConstants materialConstants{};
             material->FillConstantBuffer(materialConstants);
             commands->writeBuffer(material->materialConstants, &materialConstants, sizeof(materialConstants));
+            alternateMaterial = std::make_shared<Material>(*material);
+            alternateMaterial->baseOrDiffuseColor = float3(0.75f);
+            alternateMaterial->materialConstants = device->createBuffer(material->materialConstants->getDesc());
+            alternateMaterial->FillConstantBuffer(materialConstants);
+            commands->writeBuffer(alternateMaterial->materialConstants, &materialConstants, sizeof(materialConstants));
 
             std::array<InstanceData, GroupCount> instanceData{};
             for (auto& instance : instanceData)
@@ -215,6 +292,7 @@ namespace
                 }
 
                 instances[group] = std::make_shared<MeshInstance>(mesh);
+                geometry->texCoordDecodeRangeIndex = buffers.getTexCoordDecodeRangeIndex(mesh->vertexOffset);
                 graph->AttachLeafNode(graph->GetRootNode(), instances[group]);
                 draws[group] = { instances[group].get(), mesh.get(), geometry.get(), material.get(), &buffers, 0.f, nvrhi::RasterCullMode::None, nullptr };
 
@@ -231,29 +309,99 @@ namespace
                 .setFormat(nvrhi::Format::RGBA32_FLOAT).setIsRenderTarget(true)
                 .enableAutomaticStateTracking(nvrhi::ResourceStates::RenderTarget);
             color = device->createTexture(colorDesc);
+            alternateColor = device->createTexture(colorDesc);
             readback = device->createStagingTexture(colorDesc, nvrhi::CpuAccessMode::Read);
             depth = device->createTexture(nvrhi::TextureDesc().setWidth(Width).setHeight(Height)
                 .setFormat(nvrhi::Format::D32).setIsTypeless(true).setIsRenderTarget(true)
                 .enableAutomaticStateTracking(nvrhi::ResourceStates::DepthWrite));
             framebuffer = device->createFramebuffer(nvrhi::FramebufferDesc().addColorAttachment(color).setDepthAttachment(depth));
+            alternateFramebuffer = device->createFramebuffer(nvrhi::FramebufferDesc().addColorAttachment(alternateColor).setDepthAttachment(depth));
             view.SetViewport(nvrhi::Viewport(float(Width), float(Height)));
             view.SetMatrices(affine3::identity(), float4x4::identity());
             view.UpdateCache();
         }
 
         bool RenderAndCheck(nvrhi::IDevice* device, IGeometryPass& pass, GeometryPassContext& context, const char* name,
-            ForwardShadingPass* forward = nullptr)
+            ForwardShadingPass* forward = nullptr, bool stressStateChanges = false, bool manualDraws = false,
+            uint32_t viewRepetitions = 1, const std::function<void()>& resetBindings = {})
         {
+            std::vector<DrawItem> sequence(draws.begin(), draws.end());
+            if (stressStateChanges)
+            {
+                // Include same-format buffer switches as well as material changes
+                // within the shared UNORM buffer.
+                sequence = { draws[0], draws[4], draws[0], draws[1], draws[2], draws[2], draws[2], draws[3], draws[3], draws[2], draws[4] };
+                sequence[6].material = alternateMaterial.get();
+                sequence[8].material = alternateMaterial.get();
+            }
+            if (resetBindings)
+                sequence = { draws[0], draws[4], draws[1], draws[2], draws[3] };
+            std::array<float, GroupCount> expectedMaterial{};
+            for (const DrawItem& item : sequence)
+                for (size_t group = 0; group < GroupCount; ++group)
+                    if (item.instance == instances[group].get())
+                        expectedMaterial[group] = item.material->baseOrDiffuseColor.x;
+            if (resetBindings)
+                for (size_t group = 1; group < GroupCount; ++group)
+                    expectedMaterial[group] = alternateMaterial->baseOrDiffuseColor.x;
             auto commands = device->createCommandList();
             commands->open();
-            commands->clearTextureFloat(color, nvrhi::AllSubresources, nvrhi::Color(-99.f));
-            commands->clearDepthStencilTexture(depth, nvrhi::AllSubresources, true, 1.f, false, 0);
             if (forward)
                 forward->PrepareLights(static_cast<ForwardShadingPass::Context&>(context), commands, {}, float3(0.f), float3(0.f), {});
-            PassthroughDrawStrategy strategy;
-            strategy.SetData(draws.data(), draws.size());
-            RenderView(commands, &view, &view, framebuffer, strategy, pass, context);
-            commands->copyTexture(readback, {}, color, {});
+            for (uint32_t repetition = 0; repetition < viewRepetitions; ++repetition)
+            {
+                // A second view uses a distinct but compatible framebuffer with
+                // the same pass/context, including through the manual API.
+                const auto& targetColor = repetition % 2 ? alternateColor : color;
+                const auto& targetFramebuffer = repetition % 2 ? alternateFramebuffer : framebuffer;
+                commands->clearTextureFloat(targetColor, nvrhi::AllSubresources, nvrhi::Color(-99.f));
+                commands->clearDepthStencilTexture(depth, nvrhi::AllSubresources, true, 1.f, false, 0);
+                if (manualDraws)
+                {
+                    // Use only the existing public pass contract, without RenderView's
+                    // cache notifications. Every setGraphicsState invalidates constants.
+                    pass.SetupView(context, commands, &view, &view);
+                    for (const DrawItem& item : sequence)
+                    {
+                        nvrhi::GraphicsState state;
+                        state.framebuffer = targetFramebuffer;
+                        state.viewport = view.GetViewportState();
+                        pass.SetupInputBuffers(context, item.buffers, state);
+                        if (!pass.SetupMaterial(context, item.material, item.cullMode, state))
+                            return false;
+                        commands->setGraphicsState(state);
+                        nvrhi::DrawArguments args;
+                        args.vertexCount = item.geometry->numIndices;
+                        args.instanceCount = 1;
+                        args.startVertexLocation = item.mesh->vertexOffset + item.geometry->vertexOffsetInMesh;
+                        args.startIndexLocation = item.mesh->indexOffset + item.geometry->indexOffsetInMesh;
+                        args.startInstanceLocation = item.instance->GetInstanceIndex();
+                        pass.SetPushConstants(context, commands, state, args);
+                        commands->drawIndexed(args);
+                    }
+                }
+                else
+                {
+                    class ResetDrawStrategy : public PassthroughDrawStrategy
+                    {
+                        const std::function<void()>& resetBindings;
+                        size_t nextIndex = 0;
+                    public:
+                        explicit ResetDrawStrategy(const std::function<void()>& resetBindings)
+                            : resetBindings(resetBindings) { }
+
+                        const DrawItem* GetNextItem() override
+                        {
+                            if (nextIndex++ == 1 && resetBindings)
+                                resetBindings();
+                            return PassthroughDrawStrategy::GetNextItem();
+                        }
+                    } strategy(resetBindings);
+                    strategy.SetData(sequence.data(), sequence.size());
+                    RenderView(commands, &view, &view, targetFramebuffer, strategy, pass, context);
+                }
+            }
+            commands->copyTexture(readback, {}, viewRepetitions % 2 ? color : alternateColor, {});
             commands->close();
             device->executeCommandList(commands);
             device->waitForIdle();
@@ -268,20 +416,65 @@ namespace
                 float4 actual;
                 std::memcpy(&actual, pixels + 16 * rowPitch + (16 + 32 * group) * sizeof(float4), sizeof(actual));
                 // Allow rasterizer interpolation precision without masking incorrect UV strides or bindings.
-                const float tolerance = group == 2 ? 1e-3f : 2e-4f;
+                const float tolerance = std::abs(expected[group].x) > 1024.f ? 1e-3f : 2e-4f;
                 bool matches = std::abs(actual.x - expected[group].x) < tolerance
-                    && std::abs(actual.y - expected[group].y) < tolerance && actual.w == 1.f;
+                    && std::abs(actual.y - expected[group].y) < tolerance
+                    && actual.z == expectedMaterial[group] && actual.w == 1.f;
                 if (!matches)
-                    std::fprintf(stderr, "%s group %zu: expected (%f, %f, 0, 1), got (%f, %f, %f, %f)\n",
-                        name, group, expected[group].x, expected[group].y, actual.x, actual.y, actual.z, actual.w);
+                    std::fprintf(stderr, "%s group %zu: expected (%f, %f, %f, 1), got (%f, %f, %f, %f)\n",
+                        name, group, expected[group].x, expected[group].y, expectedMaterial[group], actual.x, actual.y, actual.z, actual.w);
                 passResult &= matches;
             }
             device->unmapStagingTexture(readback);
             std::printf("%s: %s\n", name, passResult ? "PASS" : "FAIL");
             return passResult;
         }
+
+        template<typename PassType>
+        bool ExercisePass(nvrhi::IDevice* device, PassType& pass, GeometryPassContext& context, const char* name,
+            ForwardShadingPass* forward = nullptr)
+        {
+            bool passed = RenderAndCheck(device, pass, context, name, forward);
+            // Reuse the pass and context across command lists, and twice in one list.
+            passed &= RenderAndCheck(device, pass, context, (std::string(name) + " repeated/state resets").c_str(),
+                forward, true, false, 2);
+
+            auto& ranges = instances[2]->GetMesh()->buffers->texCoordDecodeRanges;
+            const auto savedRanges = ranges;
+            const auto savedExpected = expected;
+            // Distinct geometries can share identical decode values. Change the live
+            // metadata without rebuilding the pass, then restore it for manual draws.
+            expected[2] += float2(0.5f, -0.25f);
+            ranges[0].texCoord1.offset += float2(0.5f, -0.25f);
+            expected[3] += ranges[0].texCoord1.offset - ranges[1].texCoord1.offset;
+            ranges[1].texCoord1 = ranges[0].texCoord1;
+            passed &= RenderAndCheck(device, pass, context, (std::string(name) + " equal/live decode").c_str(),
+                forward, true);
+            ranges = savedRanges;
+            expected = savedExpected;
+            passed &= RenderAndCheck(device, pass, context, (std::string(name) + " manual API").c_str(),
+                forward, true, true, 2);
+            // Clear the binding cache inside one RenderView, between two FP32
+            // buffers with the same material and pipeline key. The first draw
+            // retains its original CB; each later draw must use the replacement.
+            const auto originalMaterialBuffer = material->materialConstants;
+            passed &= RenderAndCheck(device, pass, context, (std::string(name) + " material cache clear").c_str(),
+                forward, false, false, 1, [&]()
+                {
+                    material->materialConstants = alternateMaterial->materialConstants;
+                    // Directly clear the shared cache, independently of the pass's
+                    // ResetBindingCache, to require a fresh material binding.
+                    pass.ClearMaterialBindings();
+                });
+            material->materialConstants = originalMaterialBuffer;
+            pass.ResetBindingCache();
+            return passed;
+        }
     };
 }
+
+static bool RunGpu(const std::filesystem::path& shaderPath, const std::filesystem::path& testShaderPath,
+    nvrhi::GraphicsAPI graphicsApi, bool debugRuntime);
 
 int main(int argc, char** argv)
 {
@@ -289,16 +482,19 @@ int main(int argc, char** argv)
     log::SetMinSeverity(log::Severity::Warning);
     std::filesystem::path shaderPath;
     std::filesystem::path testShaderPath;
+    bool debugRuntime = false;
     for (int arg = 1; arg < argc; ++arg)
     {
         if (std::strcmp(argv[arg], "--gpu") == 0 && arg + 1 < argc)
             shaderPath = argv[++arg];
         else if (std::strcmp(argv[arg], "--test-shaders") == 0 && arg + 1 < argc)
             testShaderPath = argv[++arg];
+        else if (std::strcmp(argv[arg], "--debug-runtime") == 0)
+            debugRuntime = true;
     }
     if (shaderPath.empty())
     {
-        std::puts("Raster GPU tests skipped; use --gpu <Donut platform shader directory> --test-shaders <test platform shader directory> [-dx11|-dx12].");
+        std::puts("Raster GPU tests skipped; use --gpu <Donut platform shader directory> --test-shaders <test platform shader directory> [-dx11|-dx12|-vk] [--debug-runtime].");
         return 77;
     }
     if (testShaderPath.empty())
@@ -308,11 +504,35 @@ int main(int argc, char** argv)
     }
 
     auto graphicsApi = app::GetGraphicsAPIFromCommandLine(argc, argv);
+    LogErrorCounter logErrors(debugRuntime && graphicsApi == nvrhi::GraphicsAPI::VULKAN);
+    const bool passed = RunGpu(shaderPath, testShaderPath, graphicsApi, debugRuntime);
+    // RunGpu has released its resources and device, so teardown errors also fail.
+    logErrors.Report();
+    return passed && logErrors.errors.load() == 0 ? 0 : 1;
+}
+
+static bool RunGpu(const std::filesystem::path& shaderPath, const std::filesystem::path& testShaderPath,
+    nvrhi::GraphicsAPI graphicsApi, bool debugRuntime)
+{
     std::unique_ptr<app::DeviceManager> manager(app::DeviceManager::Create(graphicsApi));
     app::DeviceCreationParameters parameters;
     parameters.enableNvrhiValidationLayer = true;
+    parameters.enableDebugRuntime = debugRuntime;
+#if DONUT_WITH_VULKAN
+    if (debugRuntime)
+        parameters.ignoredVulkanValidationMessageLocations.clear();
+#endif
     if (!manager || !manager->CreateHeadlessDevice(parameters))
-        return 1;
+        return false;
+    if (debugRuntime && graphicsApi == nvrhi::GraphicsAPI::VULKAN)
+    {
+        if (!manager->IsVulkanLayerEnabled("VK_LAYER_KHRONOS_validation"))
+        {
+            std::fputs("Requested Khronos Vulkan validation layer is not active.\n", stderr);
+            return false;
+        }
+        std::puts("Khronos Vulkan validation layer: ENABLED (errors checked, all messages reported)");
+    }
     auto* device = manager->GetDevice();
     auto fs = std::make_shared<vfs::RootFileSystem>();
     fs->mount("/donut", shaderPath);
@@ -336,7 +556,7 @@ int main(int argc, char** argv)
         passed &= depthPass.float16LayoutCount == 0; // Legacy FP32 layouts must not eagerly require an FP16 layout.
         passed &= depthPass.unorm16LayoutCount == 0;
         DepthPass::Context depthContext;
-        passed &= fixture.RenderAndCheck(device, depthPass, depthContext, inputAssembler ? "Depth IA mixed UV formats" : "Depth raw mixed UV formats");
+        passed &= fixture.ExercisePass(device, depthPass, depthContext, inputAssembler ? "Depth IA mixed UV formats" : "Depth raw mixed UV formats");
         passed &= depthPass.float16LayoutCount == (inputAssembler ? 1u : 0u);
         passed &= depthPass.unorm16LayoutCount == (inputAssembler ? 1u : 0u);
 
@@ -345,7 +565,7 @@ int main(int argc, char** argv)
         forwardParams.useInputAssembler = inputAssembler;
         forwardPass.Init(*factory, forwardParams);
         ForwardShadingPass::Context forwardContext;
-        passed &= fixture.RenderAndCheck(device, forwardPass, forwardContext, inputAssembler ? "Forward IA mixed UV formats" : "Forward raw mixed UV formats", &forwardPass);
+        passed &= fixture.ExercisePass(device, forwardPass, forwardContext, inputAssembler ? "Forward IA mixed UV formats" : "Forward raw mixed UV formats", &forwardPass);
 
         for (bool motionVectors : { false, true })
         {
@@ -358,9 +578,20 @@ int main(int argc, char** argv)
             const char* name = inputAssembler
                 ? (motionVectors ? "GBuffer IA mixed UV formats + motion vectors" : "GBuffer IA mixed UV formats")
                 : (motionVectors ? "GBuffer raw mixed UV formats + motion vectors" : "GBuffer raw mixed UV formats");
-            passed &= fixture.RenderAndCheck(device, gbufferPass, gbufferContext, name);
+            passed &= fixture.ExercisePass(device, gbufferPass, gbufferContext, name);
         }
+
+        LegacyDepthPass legacyPass(device, common);
+        legacyPass.Init(*factory, depthParams);
+        DepthPass::Context legacyContext;
+        const auto unmodifiedExpected = fixture.expected;
+        if (inputAssembler)
+            for (size_t group = 0; group < GroupCount; ++group)
+                fixture.expected[group] += float2(0.125f + 0.0625f * fixture.draws[group].mesh->vertexOffset, 0.25f);
+        passed &= fixture.ExercisePass(device, legacyPass, legacyContext,
+            inputAssembler ? "Custom legacy depth IA shader" : "Custom legacy depth raw shader");
+        fixture.expected = unmodifiedExpected;
     }
     device->waitForIdle();
-    return passed ? 0 : 1;
+    return passed;
 }
